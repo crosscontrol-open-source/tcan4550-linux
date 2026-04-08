@@ -49,7 +49,6 @@ const static uint32_t EVENT_FIFO_WATERMARK = 0; // watermark level to generate i
 #define TX_BUFFER_SIZE \
     (16 + 1) // size of tx-buffer used between Linux networking stack and SPI. One slot is reserved to be able to keep
              // track of if queue is full
-#define ECHO_BUFFERS 1 // Number of buffers allocated for local echo of can msgs
 
 #define NAPI_BUDGET 64 // maximum number of messages that NAPI will request
 #define RX_BUFFER_SIZE \
@@ -189,6 +188,12 @@ struct tcan4550_priv
     struct mutex spi_lock;  // mutex protecting SPI access
 
     struct napi_struct napi;
+
+    // Echo tracking: track which hardware TX FIFO slots have pending echoes
+    // When TFE fires, all FIFO messages have transmitted and echoes can be completed
+    uint32_t echo_get_idx; // next hardware FIFO index to complete
+    uint32_t echo_put_idx; // next hardware FIFO index to queue
+    spinlock_t echo_lock;  // protects echo indices
 };
 
 // SPI helper function headers
@@ -445,7 +450,9 @@ static void tcan4550_clear_sw_buffers(struct tcan4550_priv *priv)
     spin_lock_irqsave(&priv->tx_skb_lock, flags);
     while (priv->tx_skb_buf_head != priv->tx_skb_buf_tail)
     {
-        dev_kfree_skb(priv->tx_skb_buf[priv->tx_skb_buf_tail]);
+        struct sk_buff *skb                     = priv->tx_skb_buf[priv->tx_skb_buf_tail];
+        priv->tx_skb_buf[priv->tx_skb_buf_tail] = NULL;
+        dev_kfree_skb(skb);
         priv->tx_skb_buf_tail = (priv->tx_skb_buf_tail + 1) % TX_BUFFER_SIZE;
     }
     priv->tx_skb_buf_head = 0;
@@ -456,6 +463,21 @@ static void tcan4550_clear_sw_buffers(struct tcan4550_priv *priv)
     priv->rx_skb_buf_head = 0;
     priv->rx_skb_buf_tail = 0;
     spin_unlock_irqrestore(&priv->rx_skb_lock, flags);
+
+    // Clear any pending echo skbs before resetting indices
+    // Note: It is safe to call can_free_echo_skb even if the echo skb is empty
+    {
+        uint32_t i;
+        for (i = 0; i < TX_FIFO_SIZE; i++)
+        {
+            can_free_echo_skb(priv->ndev, i, NULL);
+        }
+    }
+
+    spin_lock_irqsave(&priv->echo_lock, flags);
+    priv->echo_put_idx = 0;
+    priv->echo_get_idx = 0;
+    spin_unlock_irqrestore(&priv->echo_lock, flags);
 }
 
 // convert a struct sk_buff (socket buffer) to a tcan4550 msg and store in buffer
@@ -529,33 +551,28 @@ static void tcan4550_send_msgs(struct tcan4550_priv *priv)
     // build an SPI message consisting of several CAN msgs
     while ((priv->tx_skb_buf_head != priv->tx_skb_buf_tail) && (msgs < maxMsgsToTransmit))
     {
-        int len;
         struct can_frame *frame = (struct can_frame *)priv->tx_skb_buf[priv->tx_skb_buf_tail]->data;
 
         tcan4550_skbuff_to_tcan_msg(priv->tx_skb_buf[priv->tx_skb_buf_tail], &priv->txBuffer[msgs * 4]);
 
-        // put message on echo stack
-        can_put_echo_skb(priv->tx_skb_buf[priv->tx_skb_buf_tail], priv->ndev, 0, frame->len);
-
-        // loop back the message
-        // TODO: this should preferably be done when we are sure the message is
-        // actually sent in tx interrupt
-        len = can_get_echo_skb(priv->ndev, 0, 0);
-
-        // as we loop back the message, we also need to increase rx stats
-        // Note: The original TCAN driver and also flexcan driver does this using
-        // rx_offload, other drivers such as Kvaser does not
-        stats->rx_packets++;
-        stats->rx_bytes += frame->len;
+        // Queue message on echo stack using hardware FIFO index
+        // FIX: Do NOT call can_get_echo_skb() here - it will be called from
+        // interrupt context when transmission completes. Calling it from work
+        // queue context causes ksoftirqd saturation in kernel 6.12.
+        // Use hardware writeIndex directly as echo slot (like mainline m_can driver)
+        can_put_echo_skb(priv->tx_skb_buf[priv->tx_skb_buf_tail], priv->ndev, writeIndex, frame->len);
 
         requestMask += (1 << writeIndex); // add current message to request mask
 
         msgs++;
-        writeIndex++;
+        // writeIndex tracks hardware FIFO position and must wrap modulo TX_FIFO_SIZE
+        // as it indexes message boxes in the CAN controller. The SPI burst itself
+        // never wraps (ensured by maxMsgsToTransmit limit above).
+        writeIndex = (writeIndex + 1) % TX_FIFO_SIZE;
 
         priv->tx_skb_buf_tail = (priv->tx_skb_buf_tail + 1) % TX_BUFFER_SIZE;
 
-        // update statistics
+        // update TX statistics (RX stats will be updated when echo completes)
         stats->tx_packets++;
         stats->tx_bytes += frame->len;
     }
@@ -566,17 +583,33 @@ static void tcan4550_send_msgs(struct tcan4550_priv *priv)
     {
         if (spi_write_msgs(priv, startAddress, msgs, priv->txBuffer) == 0)
         {
-            spi_write32(priv->spi, TXBAR, requestMask); // request buffer transmission
+            unsigned long echo_flags;
+            spin_lock_irqsave(&priv->echo_lock, echo_flags);
+            priv->echo_put_idx = writeIndex; // writeIndex already advanced modulo TX_FIFO_SIZE
+            spin_unlock_irqrestore(&priv->echo_lock, echo_flags);
+            spi_write32(priv->spi, TXBAR, requestMask);
         }
         else
         {
+            /* Rollback: free the echo SKBs we put in this burst */
+            uint32_t idx = (((txqfs >> 16) & 0x1F)); // original writeIndex at burst start
+            uint32_t n   = msgs;
+            while (n--)
+            {
+                can_free_echo_skb(priv->ndev, idx, NULL);
+                idx = (idx + 1) % TX_FIFO_SIZE;
+            }
             dev_err(priv->dev, "spi_write_msgs failed\n");
         }
     }
 }
 
 // this function is called from NAPI (soft-irq context) and is not allowed to
-// sleep or call functions that might sleep like SPI access
+// sleep or call functions that might sleep like SPI access.
+// FIX: The rx_skb_lock spinlock is only held while copying data out of the
+// ring buffer. netif_receive_skb() and napi_complete_done() are called after
+// the lock is released, as required by the kernel networking stack (both
+// functions require softirq context with interrupts enabled).
 static int tcan4550_poll(struct napi_struct *_napi, int budget)
 {
     struct tcan4550_priv *priv     = container_of(_napi, struct tcan4550_priv, napi);
@@ -584,22 +617,42 @@ static int tcan4550_poll(struct napi_struct *_napi, int budget)
     uint32_t msgs                  = 0;
     unsigned long flags;
 
+    // local snapshot of one raw frame, copied out under the spinlock
+    struct tcan_raw frame_snapshot;
+
     if (budget == 0)
     {
         return 0;
     }
 
-    spin_lock_irqsave(&priv->rx_skb_lock, flags);
-
-    while ((priv->rx_skb_buf_head != priv->rx_skb_buf_tail) && (msgs < budget))
+    while (msgs < budget)
     {
         struct can_frame *cf;
-        struct sk_buff *skb = alloc_can_skb(priv->ndev, &cf);
+        struct sk_buff *skb;
+        uint32_t *data;
+        bool have_frame = false;
 
+        // copy one entry out of the ring buffer under the spinlock
+        spin_lock_irqsave(&priv->rx_skb_lock, flags);
+        if (priv->rx_skb_buf_head != priv->rx_skb_buf_tail)
+        {
+            frame_snapshot        = priv->rx_skb_buf[priv->rx_skb_buf_tail];
+            priv->rx_skb_buf_tail = (priv->rx_skb_buf_tail + 1) % RX_BUFFER_SIZE;
+            have_frame            = true;
+        }
+        spin_unlock_irqrestore(&priv->rx_skb_lock, flags);
+
+        if (!have_frame)
+        {
+            break;
+        }
+
+        // allocate and deliver the skb outside the spinlock, with interrupts enabled
+        skb = alloc_can_skb(priv->ndev, &cf);
         if (skb)
         {
-            uint32_t *data = (uint32_t *)&priv->rx_skb_buf[priv->rx_skb_buf_tail].data;
-            cf->len        = (data[1] >> 16) & 0x0F;
+            data    = (uint32_t *)&frame_snapshot.data;
+            cf->len = (data[1] >> 16) & 0x0F;
 
             if (cf->len > 8)
             {
@@ -628,7 +681,6 @@ static int tcan4550_poll(struct napi_struct *_napi, int budget)
             // send message to Linux networking stack
             netif_receive_skb(skb);
 
-            priv->rx_skb_buf_tail = (priv->rx_skb_buf_tail + 1) % RX_BUFFER_SIZE;
             msgs++;
 
             stats->rx_packets++;
@@ -638,7 +690,6 @@ static int tcan4550_poll(struct napi_struct *_napi, int budget)
         {
             // we could try to allocate the skb again a little later but that might
             // also fail so we drop the packet
-            priv->rx_skb_buf_tail = (priv->rx_skb_buf_tail + 1) % RX_BUFFER_SIZE;
             msgs++;
 
             stats->rx_dropped++;
@@ -647,13 +698,13 @@ static int tcan4550_poll(struct napi_struct *_napi, int budget)
     }
 
     // If all messages did fit within budget, tell NAPI we are ready. If
-    // msgs=budget, we shall NOT call napi_complete_done
+    // msgs=budget, we shall NOT call napi_complete_done.
+    // FIX: napi_complete_done() is called here, outside the spinlock and with
+    // interrupts enabled, as required by the kernel.
     if (msgs < budget)
     {
         napi_complete_done(&priv->napi, msgs);
     }
-
-    spin_unlock_irqrestore(&priv->rx_skb_lock, flags);
 
     return msgs;
 }
@@ -860,12 +911,12 @@ static irqreturn_t tcan4550_handle_interrupts(int irq, void *dev)
     {
         tcan4550_rec_msgs(dev);
 
-        // disable bottom halves when calling napi_schedule to
-        // avoid error message "NOHZ tick-stop error: Non-RCU
-        // local softirq work is pending, handler #08!!!"
-        local_bh_disable();
+        // FIX: Call napi_schedule() directly without local_bh_disable/enable.
+        // The threaded IRQ handler runs in thread context with interrupts enabled,
+        // so plain napi_schedule() is correct and safe. The previous
+        // local_bh_disable/local_bh_enable wrapper caused local_bh_enable() to
+        // flush all pending softirqs inline, stalling the IRQ thread.
         napi_schedule(&priv->napi);
-        local_bh_enable();
     }
 
     // rx fifo 0 message lost
@@ -878,6 +929,34 @@ static irqreturn_t tcan4550_handle_interrupts(int irq, void *dev)
     // tx fifo empty
     if (ir & TFE)
     {
+        // FIX: Complete echo frames in interrupt context, not work queue context.
+        // This prevents ksoftirqd saturation in kernel 6.12.
+        // TFE means all queued messages have been transmitted.
+        // Complete all echoes from echo_get_idx to echo_put_idx.
+        struct net_device_stats *echo_stats = &(priv->ndev->stats);
+        unsigned long echo_flags;
+        uint32_t get_idx, put_idx;
+
+        spin_lock_irqsave(&priv->echo_lock, echo_flags);
+        get_idx            = priv->echo_get_idx;
+        put_idx            = priv->echo_put_idx;
+        priv->echo_get_idx = put_idx; // All caught up after this
+        spin_unlock_irqrestore(&priv->echo_lock, echo_flags);
+
+        // Complete all echoes in FIFO order using hardware indices
+        while (get_idx != put_idx)
+        {
+            unsigned int frame_len;
+            int len = can_get_echo_skb(priv->ndev, get_idx, &frame_len);
+            if (len > 0)
+            {
+                // Update RX stats for local echo (loopback)
+                echo_stats->rx_packets++;
+                echo_stats->rx_bytes += len;
+            }
+            get_idx = (get_idx + 1) % TX_FIFO_SIZE;
+        }
+
         // note that queue can only contain one item of the tx_work type so if tx_work is already on queue, no new item
         // will be added
         queue_work(priv->wq, &priv->tx_work);
@@ -1152,7 +1231,7 @@ static int tcan_probe(struct spi_device *spi)
     struct tcan4550_priv *priv;
     struct spi_delay delay = {.unit = SPI_DELAY_UNIT_USECS, .value = 0};
 
-    ndev = alloc_candev(sizeof(struct tcan4550_priv), ECHO_BUFFERS);
+    ndev = alloc_candev(sizeof(struct tcan4550_priv), TX_FIFO_SIZE);
     if (!ndev)
     {
         dev_err(&spi->dev, "could not allocate candev\n");
@@ -1190,6 +1269,7 @@ static int tcan_probe(struct spi_device *spi)
 
     spin_lock_init(&priv->tx_skb_lock);
     spin_lock_init(&priv->rx_skb_lock);
+    spin_lock_init(&priv->echo_lock);
     mutex_init(&priv->spi_lock);
 
     err = spi_setup(spi);
