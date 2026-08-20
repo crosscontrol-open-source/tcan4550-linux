@@ -1011,11 +1011,11 @@ void tcan4550_hw_reset(struct net_device *dev)
 {
     struct tcan4550_priv *priv = netdev_priv(dev);
 
-    gpiod_set_value(priv->reset_gpio, 1);
+    gpiod_set_value_cansleep(priv->reset_gpio, 1);
 
     // according to spec we need to toggle pin for at least 30us
     usleep_range(30, 100);
-    gpiod_set_value(priv->reset_gpio, 0);
+    gpiod_set_value_cansleep(priv->reset_gpio, 0);
 
     // according to spec we need to wait at least 700us for chip to become ready
     usleep_range(700, 1000);
